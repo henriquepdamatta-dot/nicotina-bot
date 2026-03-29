@@ -5,11 +5,14 @@ import http from 'http';
 
 dotenv.config();
 
-// Cria um servidor simples para o Render injetar a porta e não derrubar por inatividade de WebService
+// Isso cria uma página básica para o cron-job.org visitar
 http.createServer((req, res) => {
-  res.write('Bot do nicotina.lol está online!');
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.write('Nicotina Bot Status: Online e Operante!');
   res.end();
 }).listen(process.env.PORT || 3000);
+
+console.log("Servidor Web de monitoramento iniciado!");
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
