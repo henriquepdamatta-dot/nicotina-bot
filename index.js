@@ -1,7 +1,15 @@
 import { Client, GatewayIntentBits } from 'discord.js';
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
+import http from 'http';
+
 dotenv.config();
+
+// Cria um servidor simples para o Render injetar a porta e não derrubar por inatividade de WebService
+http.createServer((req, res) => {
+  res.write('Bot do nicotina.lol está online!');
+  res.end();
+}).listen(process.env.PORT || 3000);
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
