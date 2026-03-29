@@ -1,53 +1,58 @@
-import { Client, GatewayIntentBits } from 'discord.js';
-import { createClient } from '@supabase/supabase-js';
-import dotenv from 'dotenv';
-import http from 'http';
+require('dotenv').config();
 
-dotenv.config();
+const http = require('http');
+const { Client, GatewayIntentBits } = require('discord.js');
+const { createClient } = require('@supabase/supabase-js');
 
-// Isso cria uma página básica para o cron-job.org visitar
+// 1. INICIALIZAÇÃO IMEDIATA DO SERVIDOR (PRO RENDER NÃO DAR TIMEOUT)
+const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.write('Nicotina Bot Status: Online e Operante!');
-  res.end();
-}).listen(process.env.PORT || 3000);
+  res.writeHead(200);
+  res.end('Nicotina Bot Online!');
+}).listen(PORT, '0.0.0.0', () => {
+  console.log(`====> SERVIDOR WEB OK NA PORTA ${PORT} <====`);
+});
 
-console.log("Servidor Web de monitoramento iniciado!");
+// 2. CONFIGURAÇÃO SUPABASE
+const supabase = createClient(
+  process.env.SUPABASE_URL, 
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
-
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !DISCORD_BOT_TOKEN) {
-  console.error("Faltam variáveis de ambiente (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DISCORD_BOT_TOKEN).");
-  process.exit(1);
-}
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
+// 3. CONFIGURAÇÃO DISCORD
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers, // necessita privilégio
-    GatewayIntentBits.GuildPresences // necessita privilégio
+    GatewayIntentBits.GuildPresences,
+    GatewayIntentBits.GuildMembers
   ]
 });
 
-client.once('ready', () => {
-  console.log(`📡 Bot conectado como ${client.user.tag}! Monitorando presença...`);
+client.on('ready', () => {
+  console.log(`====> BOT LOGADO COMO ${client.user.tag} <====`);
 });
 
-client.on('presenceUpdate', async (oldPresence, newPresence) => {
-  if (!newPresence || !newPresence.user || newPresence.user.bot) return;
+// LOG DE ERROS (Para a gente saber por que falhou)
+client.on('error', (err) => console.error('ERRO DISCORD:', err));
 
-  const discordId = newPresence.userId;
-  const status = newPresence.status;
+// 4. LOGIN (Usando o nome da variável que você botou no Render)
+client.login(process.env.DISCORD_BOT_TOKEN).catch(err => {
+  console.error('FALHA NO LOGIN DO DISCORD:', err);
+});
+
+// EVENTO DE PRESENÇA (O que a gente quer)
+client.on('presenceUpdate', async (oldP, newP) => {
+  if (!newP || !newP.userId) return;
+  console.log(`Atualizando status de: ${newP.user?.username}`);
+  
+  const discordId = newP.userId;
+  const status = newP.status;
   
   // As flags do usuário (para computar de badges extras, se necessário)
-  const badges_bitfield = newPresence.user.flags?.bitfield || 0;
+  const badges_bitfield = newP.user?.flags?.bitfield || 0;
   
   // Pegando Spotify (se ativo)
-  const spotifyActivity = newPresence.activities.find(a => a.name === 'Spotify');
+  const spotifyActivity = newP.activities.find(a => a.name === 'Spotify');
   const spotify = spotifyActivity ? {
     title: spotifyActivity.details,
     artist: spotifyActivity.state,
@@ -56,7 +61,7 @@ client.on('presenceUpdate', async (oldPresence, newPresence) => {
   } : null;
 
   // Demais atividades visuais
-  const activities = newPresence.activities
+  const activities = newP.activities
     .filter(a => a.name !== 'Spotify')
     .map(a => ({
       name: a.name,
@@ -78,11 +83,9 @@ client.on('presenceUpdate', async (oldPresence, newPresence) => {
     if (error) {
       console.error(`Status update error for ${discordId}:`, error);
     } else {
-      console.log(`[Presence] OK: ${newPresence.user.username} -> ${status}`);
+      console.log(`[Presence] OK: ${newP.user?.username} -> ${status}`);
     }
   } catch (err) {
     console.error(`Erro fatal no Supabase para ${discordId}:`, err);
   }
 });
-
-client.login(DISCORD_BOT_TOKEN);

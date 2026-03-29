@@ -3,7 +3,6 @@
   "version": "1.0.0",
   "description": "Discord Bot to sync user presence with Supabase for nicotina.lol",
   "main": "index.js",
-  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
