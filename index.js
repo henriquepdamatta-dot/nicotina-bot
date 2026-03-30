@@ -29,9 +29,34 @@ process.on('unhandledRejection', error => {
   console.error('[ERRO NÃO TRATADO]:', error);
 });
 
-console.log("[2] Tentando login no Discord...");
+console.log("[2] Iniciando processo de login...");
 
-// USE O NOME EXATO QUE ESTÁ NO RENDER (DISCORD_BOT_TOKEN)
-client.login(process.env.DISCORD_BOT_TOKEN).catch(err => {
-  console.error('[ERRO NO LOGIN]:', err.message);
-});
+const token = process.env.DISCORD_BOT_TOKEN;
+
+if (!token) {
+  console.error("❌ ERRO: A variável DISCORD_BOT_TOKEN está vazia no Render!");
+} else {
+  // O .trim() remove espaços invisíveis que você pode ter copiado sem querer
+  const tokenLimpo = token.trim();
+  
+  console.log(`[DEBUG] Token carregado (Inicia com: ${tokenLimpo.substring(0, 10)}...)`);
+  console.log(`[DEBUG] Tamanho do token: ${tokenLimpo.length} caracteres`);
+
+  client.login(tokenLimpo)
+    .then(() => {
+      console.log(`[3] ✅ SUCESSO: O bot ${client.user.tag} está ONLINE!`);
+    })
+    .catch(err => {
+      console.error('[ERRO NO LOGIN]:', err.message);
+      if (err.message.includes("Privileged intent")) {
+        console.error("⚠️ O Discord negou as Intents. Verifique se você SALVOU no Developer Portal.");
+      }
+    });
+}
+
+// Timeout de segurança: se em 20 segundos não logar, ele avisa
+setTimeout(() => {
+  if (!client.user) {
+    console.log("⏳ AVISO: O login está demorando demais. Pode ser rede ou Token bloqueado.");
+  }
+}, 20000);
