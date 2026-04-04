@@ -3,11 +3,79 @@ const http = require('http');
 const { Client, GatewayIntentBits, ActivityType } = require('discord.js');
 const { createClient } = require('@supabase/supabase-js');
 
-// 1. SERVIDOR WEB DO RENDER
+// 1. SERVIDOR WEB DO RENDER (COM ENDPOINT /JOIN)
 const PORT = process.env.PORT || 10000;
-http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end('Nicotina Bot Ativo e Fechando Presence!');
+const GUILD_ID = '1481726829810159671'; // IDs do Servidor Nicotina
+
+http.createServer(async (req, res) => {
+  // CORS simplificado para facilitar chamadas do frontend
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  // Endpoint de Saúde
+  if (req.method === 'GET' && req.url === '/') {
+    res.writeHead(200);
+    res.end('Nicotina Bot Ativo e Fechando Presence!');
+    return;
+  }
+
+  // Endpoint para Join Automático
+  if (req.method === 'POST' && req.url === '/join') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const { accessToken, userId } = JSON.parse(body);
+
+        if (!accessToken || !userId) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'accessToken e userId são necessários' }));
+          return;
+        }
+
+        console.log(`[Join] Tentando adicionar usuário ${userId} ao servidor via OAuth2...`);
+
+        const response = await fetch(`https://discord.com/api/v10/guilds/${GUILD_ID}/members/${userId}`, {
+          method: 'PUT',
+          headers: {
+            'Authorization': `Bot ${process.env.DISCORD_BOT_TOKEN}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ access_token: accessToken })
+        });
+
+        if (response.status === 201) {
+          console.log(`[Join] ✅ Usuário ${userId} adicionado com sucesso!`);
+          res.writeHead(201);
+          res.end(JSON.stringify({ success: true, message: 'Adicionado' }));
+        } else if (response.status === 204) {
+          console.log(`[Join] ℹ️ Usuário ${userId} já está no servidor.`);
+          res.writeHead(200);
+          res.end(JSON.stringify({ success: true, message: 'Já é membro' }));
+        } else {
+          const errorData = await response.json();
+          console.error(`[Join] ❌ Erro da API Discord (${response.status}):`, errorData);
+          res.writeHead(response.status);
+          res.end(JSON.stringify({ success: false, error: errorData }));
+        }
+      } catch (err) {
+        console.error('[Join] 💥 Erro no processamento:', err);
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: 'Erro interno no servidor do bot' }));
+      }
+    });
+    return;
+  }
+
+  res.writeHead(404);
+  res.end();
 }).listen(PORT, '0.0.0.0', () => {
   console.log(`[1] SERVIDOR WEB OK - PORTA ${PORT}`);
 });
