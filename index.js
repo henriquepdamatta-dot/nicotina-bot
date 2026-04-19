@@ -3,86 +3,95 @@ const http = require('http');
 const { Client, GatewayIntentBits } = require('discord.js');
 const { createClient } = require('@supabase/supabase-js');
 
-// ─── 1. SERVIDOR WEB DO RENDER (COM ENDPOINT /JOIN) ───────────────────────────
+// ━━ 1. SERVIDOR WEB ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 const PORT = process.env.PORT || 10000;
-const GUILD_ID = '1481726829810159671'; // IDs do Servidor Nicotina
+// ID do servidor nicotina (onde o bot monitora presença)
+const NICOTINA_GUILD_ID = process.env.NICOTINA_GUILD_ID || '1481726829810159671';
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try { resolve(JSON.parse(body)); }
+      catch { resolve({}); }
+    });
+    req.on('error', reject);
+  });
+}
 
 http.createServer(async (req, res) => {
-  // CORS simplificado para facilitar chamadas do frontend
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  // Endpoint de Saúde
+  // ── Health ──────────────────────────────────────────────────────────────────
   if (req.method === 'GET' && req.url === '/') {
     res.writeHead(200);
     res.end('Nicotina Bot: Ativo!');
     return;
   }
 
-  // Endpoint para Join Automático
+  // ── /join — adiciona o usuário ao servidor Nicotina automaticamente ─────────
+  // Chamado pelo Dashboard logo após o login com Discord OAuth.
+  // Requer: { accessToken, userId }
   if (req.method === 'POST' && req.url === '/join') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', async () => {
-      try {
-        const { accessToken, userId } = JSON.parse(body);
+    const { accessToken, userId } = await readBody(req);
 
-        if (!accessToken || !userId) {
-          res.writeHead(400);
-          res.end(JSON.stringify({ error: 'accessToken e userId são necessários' }));
-          return;
-        }
+    if (!accessToken || !userId) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'accessToken e userId são necessários' }));
+      return;
+    }
 
-        console.log(`[Join] Tentando adicionar usuário ${userId} ao servidor via OAuth2...`);
+    console.log(`[Join] Adicionando ${userId} ao servidor nicotina...`);
 
-        const response = await fetch(`https://discord.com/api/v10/guilds/${GUILD_ID}/members/${userId}`, {
+    try {
+      const response = await fetch(
+        `https://discord.com/api/v10/guilds/${NICOTINA_GUILD_ID}/members/${userId}`,
+        {
           method: 'PUT',
           headers: {
-            'Authorization': `Bot ${process.env.DISCORD_BOT_TOKEN}`,
-            'Content-Type': 'application/json'
+            Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
+            'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ access_token: accessToken })
-        });
-
-        if (response.status === 201) {
-          console.log(`[Join] ✅ Usuário ${userId} adicionado com sucesso!`);
-          res.writeHead(201);
-          res.end(JSON.stringify({ success: true, message: 'Adicionado' }));
-        } else if (response.status === 204) {
-          console.log(`[Join] ℹ️ Usuário ${userId} já está no servidor.`);
-          res.writeHead(200);
-          res.end(JSON.stringify({ success: true, message: 'Já é membro' }));
-        } else {
-          const errorData = await response.json();
-          console.error(`[Join] ❌ Erro da API Discord (${response.status}):`, errorData);
-          res.writeHead(response.status);
-          res.end(JSON.stringify({ success: false, error: errorData }));
+          body: JSON.stringify({ access_token: accessToken }),
         }
-      } catch (err) {
-        console.error('[Join] 💥 Erro no processamento:', err);
-        res.writeHead(500);
-        res.end(JSON.stringify({ error: 'Erro interno no servidor do bot' }));
+      );
+
+      if (response.status === 201) {
+        console.log(`[Join] ✅ ${userId} adicionado com sucesso!`);
+        res.writeHead(201);
+        res.end(JSON.stringify({ success: true, message: 'Adicionado ao servidor' }));
+      } else if (response.status === 204) {
+        console.log(`[Join] ℹ️ ${userId} já era membro.`);
+        res.writeHead(200);
+        res.end(JSON.stringify({ success: true, message: 'Já é membro' }));
+      } else {
+        const errorData = await response.json().catch(() => ({}));
+        console.error(`[Join] ❌ Erro Discord (${response.status}):`, errorData);
+        res.writeHead(response.status);
+        res.end(JSON.stringify({ success: false, error: errorData }));
       }
-    });
+    } catch (err) {
+      console.error('[Join] 💥 Erro:', err);
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: 'Erro interno no servidor do bot' }));
+    }
     return;
   }
 
   res.writeHead(404);
   res.end();
 }).listen(PORT, '0.0.0.0', () => {
-  console.log(`[1] SERVIDOR WEB OK - PORTA ${PORT}`);
+  console.log(`[1] SERVIDOR WEB OK — PORTA ${PORT}`);
 });
 
-// ─── 2. SUPABASE ──────────────────────────────────────────────────────────────
+// ━━ 2. SUPABASE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('⚠️ ERRO CRÍTICO: Variáveis SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY ausentes!');
+  console.error('💥 ERRO CRÍTICO: SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY ausentes!');
   process.exit(1);
 }
 const supabase = createClient(
@@ -90,7 +99,7 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// ─── 3. BOT DISCORD ───────────────────────────────────────────────────────────
+// ━━ 3. BOT DISCORD ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -102,7 +111,7 @@ const client = new Client({
 client.on('ready', async () => {
   console.log(`[3] ✅ BOT ONLINE: ${client.user.tag}`);
 
-  // Sincronização inicial: percorre todos os membros de todos os servidores
+  // Sincronização inicial de todos os membros do servidor nicotina
   for (const guild of client.guilds.cache.values()) {
     try {
       const members = await guild.members.fetch();
@@ -130,7 +139,10 @@ client.on('ready', async () => {
 
 client.on('error', (e) => console.error('[ERRO BOT]', e));
 
-// ─── 4. PRESENÇA EM TEMPO REAL ────────────────────────────────────────────────
+// ━━ 4. PRESENÇA EM TEMPO REAL ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Captura mudanças de presença de QUALQUER membro dos servidores onde o bot está.
+// Como o /join garante que cada usuário que loga entra no servidor nicotina,
+// o bot verá a presença deles automaticamente.
 client.on('presenceUpdate', async (oldPresence, newPresence) => {
   if (!newPresence || !newPresence.user) return;
 
@@ -153,18 +165,29 @@ client.on('presenceUpdate', async (oldPresence, newPresence) => {
       }
     }
   } catch (err) {
-    console.warn(`[FLAGS] Não foi possível buscar member completo de ${discordId}:`, err.message);
+    console.warn(`[FLAGS] Não foi possível buscar member de ${discordId}:`, err.message);
   }
 
   let spotify = null;
   const activities = [];
+
   for (const activity of newPresence.activities) {
     if (activity.name === 'Spotify') {
+      // Salva o largeImage do Spotify — pode ser "spotify:track:ID" ou URL direta
+      const rawAlbumArt = activity.assets?.largeImage || null;
       spotify = {
         title: activity.details || '',
         artist: activity.state || '',
-        album: activity.assets?.largeImage || null,
+        // Normaliza para URL da CDN do Spotify
+        album: rawAlbumArt
+          ? (rawAlbumArt.startsWith('spotify:')
+              ? `https://i.scdn.co/image/${rawAlbumArt.split(':')[2] || rawAlbumArt.split(':')[1]}`
+              : rawAlbumArt)
+          : null,
         trackId: activity.syncId || null,
+        timestamps: activity.timestamps
+          ? { start: activity.timestamps.start?.getTime?.() ?? 0, end: activity.timestamps.end?.getTime?.() ?? 0 }
+          : { start: 0, end: 0 },
       };
     } else {
       activities.push({
@@ -173,6 +196,17 @@ client.on('presenceUpdate', async (oldPresence, newPresence) => {
         details: activity.details || '',
         state: activity.state || '',
         type: activity.type,
+        assets: activity.assets
+          ? {
+              large_image: activity.assets.largeImage || null,
+              large_text: activity.assets.largeText || null,
+              small_image: activity.assets.smallImage || null,
+              small_text: activity.assets.smallText || null,
+            }
+          : null,
+        timestamps: activity.timestamps
+          ? { start: activity.timestamps.start?.getTime?.() ?? null, end: activity.timestamps.end?.getTime?.() ?? null }
+          : null,
       });
     }
   }
@@ -181,19 +215,24 @@ client.on('presenceUpdate', async (oldPresence, newPresence) => {
   await syncBadgesInProfile(discordId, badgesBitfield, nitroType);
 });
 
+// ━━ 5. HELPERS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 async function upsertPresence(discordId, status, activities, spotify, badgesBitfield, nitroType) {
   try {
     const { error } = await supabase
       .from('user_presence')
-      .upsert({
-        discord_id: discordId,
-        status: status,
-        badges_bitfield: String(badgesBitfield), // Salva como string para suportar BigInt no Supabase
-        nitro_type: nitroType,
-        spotify: spotify,
-        activities: activities,
-        updated_at: new Date().toISOString(),
-      }, { onConflict: 'discord_id' });
+      .upsert(
+        {
+          discord_id: discordId,
+          status,
+          badges_bitfield: String(badgesBitfield),
+          nitro_type: nitroType,
+          spotify,
+          activities,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'discord_id' }
+      );
 
     if (error) {
       console.error(`[Presence] Erro ao sincronizar ${discordId}:`, error.message);
@@ -211,7 +250,7 @@ async function syncBadgesInProfile(discordId, publicFlags, premiumType) {
   try {
     const { error } = await supabase.rpc('bot_sync_discord_badges', {
       p_discord_id: discordId,
-      p_public_flags: String(publicFlags), // BigInt via String para o RPC
+      p_public_flags: String(publicFlags),
       p_premium_type: premiumType || 0,
     });
 
@@ -228,7 +267,7 @@ async function syncBadgesInProfile(discordId, publicFlags, premiumType) {
 }
 
 if (!process.env.DISCORD_BOT_TOKEN) {
-  console.error('❌ ERRO: DISCORD_BOT_TOKEN ausente!');
+  console.error('💥 ERRO: DISCORD_BOT_TOKEN ausente!');
   process.exit(1);
 }
 client.login(process.env.DISCORD_BOT_TOKEN.trim());
