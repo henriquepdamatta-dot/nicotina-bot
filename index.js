@@ -3,9 +3,7 @@ const http = require('http');
 const { Client, GatewayIntentBits } = require('discord.js');
 const { createClient } = require('@supabase/supabase-js');
 
-// ━━ 1. SERVIDOR WEB ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 const PORT = process.env.PORT || 10000;
-// ID do servidor nicotina (onde o bot monitora presença)
 const NICOTINA_GUILD_ID = process.env.NICOTINA_GUILD_ID || '1481726829810159671';
 
 function readBody(req) {
@@ -13,11 +11,149 @@ function readBody(req) {
     let body = '';
     req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
-      try { resolve(JSON.parse(body)); }
-      catch { resolve({}); }
+      try { resolve(JSON.parse(body)); } catch { resolve({}); }
     });
     req.on('error', reject);
   });
+}
+
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('💥 ERRO CRÍTICO: SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY ausentes!');
+  process.exit(1);
+}
+
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildPresences,
+    GatewayIntentBits.GuildMembers,
+  ],
+});
+
+function normalizeSpotifyAsset(rawAlbumArt) {
+  if (!rawAlbumArt) return null;
+  if (!rawAlbumArt.startsWith('spotify:')) return rawAlbumArt;
+  const parts = rawAlbumArt.split(':');
+  const imageId = parts[2] || parts[1];
+  return imageId ? `https://i.scdn.co/image/${imageId}` : null;
+}
+
+function serializePresence(presence) {
+  if (!presence) return null;
+
+  let spotify = null;
+  const activities = [];
+
+  for (const activity of presence.activities || []) {
+    if (activity.name === 'Spotify' || activity.type === 2) {
+      spotify = {
+        title: activity.details || '',
+        artist: activity.state || '',
+        album: normalizeSpotifyAsset(activity.assets?.largeImage || null),
+        albumName: activity.assets?.largeText || '',
+        trackId: activity.syncId || null,
+        timestamps: activity.timestamps
+          ? {
+              start: activity.timestamps.start?.getTime?.() ?? 0,
+              end: activity.timestamps.end?.getTime?.() ?? 0,
+            }
+          : { start: 0, end: 0 },
+      };
+      continue;
+    }
+
+    activities.push({
+      id: activity.id || activity.name,
+      name: activity.name,
+      details: activity.details || '',
+      state: activity.state || '',
+      type: activity.type,
+      application_id: activity.applicationId || null,
+      assets: activity.assets
+        ? {
+            large_image: activity.assets.largeImage || null,
+            large_text: activity.assets.largeText || null,
+            small_image: activity.assets.smallImage || null,
+            small_text: activity.assets.smallText || null,
+          }
+        : null,
+      timestamps: activity.timestamps
+        ? {
+            start: activity.timestamps.start?.getTime?.() ?? null,
+            end: activity.timestamps.end?.getTime?.() ?? null,
+          }
+        : null,
+    });
+  }
+
+  return {
+    status: presence.status || 'offline',
+    spotify,
+    activities,
+  };
+}
+
+async function upsertPresence(discordId, status, activities, spotify, badgesBitfield, nitroType) {
+  try {
+    const { error } = await supabase.from('user_presence').upsert(
+      {
+        discord_id: discordId,
+        status,
+        badges_bitfield: String(badgesBitfield),
+        nitro_type: nitroType,
+        spotify,
+        activities,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'discord_id' }
+    );
+
+    if (error) console.error(`[Presence] Erro ao sincronizar ${discordId}:`, error.message);
+    else console.log(`[Presence] ✅ ${discordId} → ${status} | acts=${activities.length} | spotify=${Boolean(spotify)}`);
+  } catch (err) {
+    console.error(`[Presence CATCH] ${discordId}:`, err.message);
+  }
+}
+
+async function syncBadgesInProfile(discordId, publicFlags, premiumType) {
+  if (!discordId || publicFlags === undefined) return;
+  try {
+    const { error } = await supabase.rpc('bot_sync_discord_badges', {
+      p_discord_id: discordId,
+      p_public_flags: String(publicFlags),
+      p_premium_type: premiumType || 0,
+    });
+    if (error) {
+      if (!error.message?.includes('No rows')) console.error(`[Profile Sync] Erro ao sincronizar badge de ${discordId}:`, error.message);
+    } else {
+      console.log(`[Profile Sync] ✅ Badges de ${discordId} sincronizadas.`);
+    }
+  } catch (err) {
+    console.error(`[Profile Sync CATCH] ${discordId}:`, err.message);
+  }
+}
+
+async function syncMember(member, { preserveWhenPresenceMissing = true } = {}) {
+  if (!member || member.user?.bot) return;
+
+  const user = member.user;
+  const discordId = user.id;
+  const badgesBitfield = BigInt(user.flags ? user.flags.bitfield : 0);
+  const hasAnimatedAvatar = user.avatar ? user.avatar.startsWith('a_') : false;
+  const nitroType = hasAnimatedAvatar ? 2 : 0;
+  const serialized = serializePresence(member.presence);
+
+  // Presence ausente no boot não significa necessariamente offline. Não apagamos uma
+  // presença válida já armazenada só porque o Gateway ainda não a entregou.
+  if (serialized) {
+    await upsertPresence(discordId, serialized.status, serialized.activities, serialized.spotify, badgesBitfield, nitroType);
+  } else if (!preserveWhenPresenceMissing) {
+    await upsertPresence(discordId, 'offline', [], null, badgesBitfield, nitroType);
+  }
+
+  await syncBadgesInProfile(discordId, badgesBitfield, nitroType);
 }
 
 http.createServer(async (req, res) => {
@@ -27,57 +163,48 @@ http.createServer(async (req, res) => {
 
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  // ── Health ──────────────────────────────────────────────────────────────────
   if (req.method === 'GET' && req.url === '/') {
-    res.writeHead(200);
-    res.end('Nicotina Bot: Ativo!');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, service: 'nicotina-bot', discordReady: client.isReady() }));
     return;
   }
 
-  // ── /join — adiciona o usuário ao servidor Nicotina automaticamente ─────────
-  // Chamado pelo Dashboard logo após o login com Discord OAuth.
-  // Requer: { accessToken, userId }
   if (req.method === 'POST' && req.url === '/join') {
     const { accessToken, userId } = await readBody(req);
-
     if (!accessToken || !userId) {
-      res.writeHead(400);
+      res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'accessToken e userId são necessários' }));
       return;
     }
 
-    console.log(`[Join] Adicionando ${userId} ao servidor nicotina...`);
-
     try {
-      const response = await fetch(
-        `https://discord.com/api/v10/guilds/${NICOTINA_GUILD_ID}/members/${userId}`,
-        {
-          method: 'PUT',
-          headers: {
-            Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ access_token: accessToken }),
-        }
-      );
+      const response = await fetch(`https://discord.com/api/v10/guilds/${NICOTINA_GUILD_ID}/members/${userId}`, {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ access_token: accessToken }),
+      });
 
-      if (response.status === 201) {
-        console.log(`[Join] ✅ ${userId} adicionado com sucesso!`);
-        res.writeHead(201);
-        res.end(JSON.stringify({ success: true, message: 'Adicionado ao servidor' }));
-      } else if (response.status === 204) {
-        console.log(`[Join] ℹ️ ${userId} já era membro.`);
-        res.writeHead(200);
-        res.end(JSON.stringify({ success: true, message: 'Já é membro' }));
+      if (response.status === 201 || response.status === 204) {
+        const guild = client.guilds.cache.get(NICOTINA_GUILD_ID);
+        if (guild) {
+          // Pede a presença deste usuário imediatamente após o join/login.
+          const fetched = await guild.members.fetch({ user: userId, force: true, withPresences: true }).catch(() => null);
+          if (fetched) await syncMember(fetched);
+        }
+        res.writeHead(response.status === 201 ? 201 : 200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, message: response.status === 201 ? 'Adicionado ao servidor' : 'Já é membro' }));
       } else {
         const errorData = await response.json().catch(() => ({}));
         console.error(`[Join] ❌ Erro Discord (${response.status}):`, errorData);
-        res.writeHead(response.status);
+        res.writeHead(response.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: false, error: errorData }));
       }
     } catch (err) {
       console.error('[Join] 💥 Erro:', err);
-      res.writeHead(500);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Erro interno no servidor do bot' }));
     }
     return;
@@ -85,50 +212,18 @@ http.createServer(async (req, res) => {
 
   res.writeHead(404);
   res.end();
-}).listen(PORT, '0.0.0.0', () => {
-  console.log(`[1] SERVIDOR WEB OK — PORTA ${PORT}`);
-});
+}).listen(PORT, '0.0.0.0', () => console.log(`[WEB] Servidor HTTP ativo na porta ${PORT}`));
 
-// ━━ 2. SUPABASE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('💥 ERRO CRÍTICO: SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY ausentes!');
-  process.exit(1);
-}
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+client.once('ready', async () => {
+  console.log(`[BOT] ✅ ONLINE: ${client.user.tag}`);
 
-// ━━ 3. BOT DISCORD ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildPresences,
-    GatewayIntentBits.GuildMembers,
-  ],
-});
-
-client.on('ready', async () => {
-  console.log(`[3] ✅ BOT ONLINE: ${client.user.tag}`);
-
-  // Sincronização inicial de todos os membros do servidor nicotina
   for (const guild of client.guilds.cache.values()) {
     try {
-      const members = await guild.members.fetch();
-      console.log(`[INIT] Sincronizando ${members.size} membros de "${guild.name}"...`);
-
-      for (const member of members.values()) {
-        const user = member.user;
-        if (user.bot) continue;
-
-        const discordId = user.id;
-        const badgesBitfield = BigInt(user.flags ? user.flags.bitfield : 0);
-        const hasAnimatedAvatar = user.avatar ? user.avatar.startsWith('a_') : false;
-        const nitroType = hasAnimatedAvatar ? 2 : 0;
-
-        await upsertPresence(discordId, 'offline', [], null, badgesBitfield, nitroType);
-        await syncBadgesInProfile(discordId, badgesBitfield, nitroType);
-      }
+      // Discord.js pode solicitar os membros com presença. Isso evita o bug antigo
+      // que marcava todos offline e apagava Spotify/atividades em todo restart.
+      const members = await guild.members.fetch({ withPresences: true });
+      console.log(`[INIT] Sincronizando ${members.size} membros de "${guild.name}" com presença...`);
+      for (const member of members.values()) await syncMember(member);
     } catch (err) {
       console.error(`[INIT] Erro ao sincronizar membros de ${guild.name}:`, err.message);
     }
@@ -137,134 +232,25 @@ client.on('ready', async () => {
   console.log('[INIT] ✅ Sincronização inicial concluída.');
 });
 
-client.on('error', (e) => console.error('[ERRO BOT]', e));
-
-// ━━ 4. PRESENÇA EM TEMPO REAL ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// Captura mudanças de presença de QUALQUER membro dos servidores onde o bot está.
-// Como o /join garante que cada usuário que loga entra no servidor nicotina,
-// o bot verá a presença deles automaticamente.
-client.on('presenceUpdate', async (oldPresence, newPresence) => {
-  if (!newPresence || !newPresence.user) return;
-
-  const user = newPresence.user;
-  const discordId = user.id;
-  if (user.bot) return;
-
-  const status = newPresence.status || 'offline';
-  let badgesBitfield = BigInt(user.flags ? user.flags.bitfield : 0);
-  let nitroType = 0;
-
-  try {
-    const guild = newPresence.guild;
-    if (guild) {
-      const member = await guild.members.fetch({ user: discordId, force: true }).catch(() => null);
-      if (member) {
-        badgesBitfield = BigInt(member.user.flags ? member.user.flags.bitfield : 0);
-        const hasAnimatedAvatar = member.user.avatar ? member.user.avatar.startsWith('a_') : false;
-        nitroType = hasAnimatedAvatar ? 2 : 0;
-      }
-    }
-  } catch (err) {
-    console.warn(`[FLAGS] Não foi possível buscar member de ${discordId}:`, err.message);
-  }
-
-  let spotify = null;
-  const activities = [];
-
-  for (const activity of newPresence.activities) {
-    if (activity.name === 'Spotify') {
-      // Salva o largeImage do Spotify — pode ser "spotify:track:ID" ou URL direta
-      const rawAlbumArt = activity.assets?.largeImage || null;
-      spotify = {
-        title: activity.details || '',
-        artist: activity.state || '',
-        // Normaliza para URL da CDN do Spotify
-        album: rawAlbumArt
-          ? (rawAlbumArt.startsWith('spotify:')
-              ? `https://i.scdn.co/image/${rawAlbumArt.split(':')[2] || rawAlbumArt.split(':')[1]}`
-              : rawAlbumArt)
-          : null,
-        trackId: activity.syncId || null,
-        timestamps: activity.timestamps
-          ? { start: activity.timestamps.start?.getTime?.() ?? 0, end: activity.timestamps.end?.getTime?.() ?? 0 }
-          : { start: 0, end: 0 },
-      };
-    } else {
-      activities.push({
-        id: activity.id || activity.name,
-        name: activity.name,
-        details: activity.details || '',
-        state: activity.state || '',
-        type: activity.type,
-        assets: activity.assets
-          ? {
-              large_image: activity.assets.largeImage || null,
-              large_text: activity.assets.largeText || null,
-              small_image: activity.assets.smallImage || null,
-              small_text: activity.assets.smallText || null,
-            }
-          : null,
-        timestamps: activity.timestamps
-          ? { start: activity.timestamps.start?.getTime?.() ?? null, end: activity.timestamps.end?.getTime?.() ?? null }
-          : null,
-      });
-    }
-  }
-
-  await upsertPresence(discordId, status, activities, spotify, badgesBitfield, nitroType);
-  await syncBadgesInProfile(discordId, badgesBitfield, nitroType);
+client.on('presenceUpdate', async (_oldPresence, newPresence) => {
+  if (!newPresence?.userId) return;
+  const member = newPresence.member;
+  if (!member || member.user?.bot) return;
+  await syncMember(member, { preserveWhenPresenceMissing: false });
 });
 
-// ━━ 5. HELPERS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+client.on('guildMemberAdd', async (member) => {
+  if (member.user?.bot) return;
+  const fetched = await member.guild.members.fetch({ user: member.id, force: true, withPresences: true }).catch(() => member);
+  await syncMember(fetched);
+});
 
-async function upsertPresence(discordId, status, activities, spotify, badgesBitfield, nitroType) {
-  try {
-    const { error } = await supabase
-      .from('user_presence')
-      .upsert(
-        {
-          discord_id: discordId,
-          status,
-          badges_bitfield: String(badgesBitfield),
-          nitro_type: nitroType,
-          spotify,
-          activities,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: 'discord_id' }
-      );
+client.on('guildMemberUpdate', async (_oldMember, newMember) => {
+  if (newMember.user?.bot) return;
+  await syncMember(newMember);
+});
 
-    if (error) {
-      console.error(`[Presence] Erro ao sincronizar ${discordId}:`, error.message);
-    } else {
-      console.log(`[Presence] ✅ ${discordId} → ${status} | flags=${badgesBitfield}`);
-    }
-  } catch (err) {
-    console.error(`[Presence CATCH] ${discordId}:`, err.message);
-  }
-}
-
-async function syncBadgesInProfile(discordId, publicFlags, premiumType) {
-  if (!discordId || publicFlags === undefined) return;
-
-  try {
-    const { error } = await supabase.rpc('bot_sync_discord_badges', {
-      p_discord_id: discordId,
-      p_public_flags: String(publicFlags),
-      p_premium_type: premiumType || 0,
-    });
-
-    if (error) {
-      if (!error.message?.includes('No rows')) {
-        console.error(`[Profile Sync] Erro ao sincronizar badge de ${discordId}:`, error.message);
-      }
-    } else {
-      console.log(`[Profile Sync] ✅ Badges de ${discordId} sincronizadas.`);
-    }
-  } catch (err) {
-    console.error(`[Profile Sync CATCH] ${discordId}:`, err.message);
-  }
-}
+client.on('error', (e) => console.error('[ERRO BOT]', e));
 
 if (!process.env.DISCORD_BOT_TOKEN) {
   console.error('💥 ERRO: DISCORD_BOT_TOKEN ausente!');
