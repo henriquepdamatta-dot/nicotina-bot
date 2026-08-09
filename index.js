@@ -66,11 +66,12 @@ function serializePresence(presence) {
 async function getStoredPremiumMeta(discordId) {
   const [{ data: presence }, { data: profile }] = await Promise.all([
     supabase.from('user_presence').select('nitro_type').eq('discord_id', discordId).maybeSingle(),
-    supabase.from('social_profiles').select('premium_type, discord_nitro_months').eq('public_discord_id', discordId).maybeSingle(),
+    supabase.from('social_profiles').select('premium_type, discord_nitro_months, discord_boost_months').eq('public_discord_id', discordId).maybeSingle(),
   ]);
   return {
     premiumType: Math.max(Number(presence?.nitro_type || 0), Number(profile?.premium_type || 0)),
     nitroMonths: Number(profile?.discord_nitro_months || 0),
+    boostMonths: Number(profile?.discord_boost_months || 0),
   };
 }
 
@@ -132,11 +133,18 @@ async function fetchOAuthProfile(accessToken) {
   };
 }
 
-function extractNitroMeta(profile) {
-  if (!profile) return { premiumType: 0, nitroMonths: null };
+function extractPremiumMeta(profile) {
+  if (!profile) return { premiumType: 0, nitroMonths: null, boostMonths: null };
   const premiumType = Number(profile.premium_type ?? profile.user?.premium_type ?? 0);
   const since = profile.premium_since ?? profile.premium_subscription_since ?? profile.user?.premium_since ?? profile.user?.premium_subscription_since ?? null;
-  return { premiumType, nitroMonths: since ? Math.max(1, completedMonthsSince(since)) : null };
+  // premium_guild_since is the global "Server Boosting" timestamp: it is set when the
+  // user boosts any guild, unlike member.premiumSince which only covers this guild.
+  const boostSince = profile.premium_guild_since ?? profile.premium_guild_subscription_since ?? profile.user?.premium_guild_since ?? profile.user?.premium_guild_subscription_since ?? null;
+  return {
+    premiumType,
+    nitroMonths: since ? Math.max(1, completedMonthsSince(since)) : null,
+    boostMonths: boostSince ? Math.max(1, completedMonthsSince(boostSince)) : null,
+  };
 }
 
 async function syncMember(member, { preserveWhenPresenceMissing = true, oauthMeta = null } = {}) {
@@ -148,7 +156,12 @@ async function syncMember(member, { preserveWhenPresenceMissing = true, oauthMet
   const oauthPremiumType = Number(oauthMeta?.premiumType || 0);
   const premiumType = oauthPremiumType > 0 ? oauthPremiumType : stored.premiumType;
   const nitroMonths = Number(oauthMeta?.nitroMonths || 0) > 0 ? Number(oauthMeta.nitroMonths) : stored.nitroMonths;
-  const boostMonths = member.premiumSince ? Math.max(1, completedMonthsSince(member.premiumSince)) : 0;
+  // Boost can come from this guild or, via OAuth, from any guild the user boosts.
+  // Fall back to the stored value so presence-only syncs never wipe it back to zero.
+  const guildBoostMonths = member.premiumSince ? Math.max(1, completedMonthsSince(member.premiumSince)) : 0;
+  const oauthBoostMonths = Number(oauthMeta?.boostMonths || 0);
+  const freshBoostMonths = Math.max(guildBoostMonths, oauthBoostMonths);
+  const boostMonths = freshBoostMonths > 0 ? freshBoostMonths : stored.boostMonths;
   const serialized = serializePresence(member.presence);
 
   if (serialized) await upsertPresence(user.id, serialized.status, serialized.activities, serialized.spotify, badgesBitfield, premiumType);
@@ -168,7 +181,7 @@ async function syncExistingMember(accessToken, userId) {
   if (!identity) return { ok: false, status: 401, error: 'OAuth token does not belong to this Discord user.' };
 
   const oauthProfile = await fetchOAuthProfile(accessToken);
-  const oauthMeta = extractNitroMeta(oauthProfile);
+  const oauthMeta = extractPremiumMeta(oauthProfile);
   const guild = client.guilds.cache.get(NICOTINA_GUILD_ID);
   if (!guild) return { ok: false, status: 503, error: 'Guild not available in bot cache.' };
 
@@ -176,7 +189,7 @@ async function syncExistingMember(accessToken, userId) {
   if (!member) return { ok: false, status: 404, error: 'Discord member not found in nicotina guild.' };
 
   const synced = await syncMember(member, { oauthMeta });
-  console.log(`[OAuth Nitro] ${userId}: premiumType=${oauthMeta.premiumType}, months=${oauthMeta.nitroMonths ?? 'unavailable'}, boost=${synced?.boostMonths ?? 0}`);
+  console.log(`[OAuth Premium] ${userId}: premiumType=${oauthMeta.premiumType}, nitroMonths=${oauthMeta.nitroMonths ?? 'unavailable'}, oauthBoostMonths=${oauthMeta.boostMonths ?? 'unavailable'}, boost=${synced?.boostMonths ?? 0}`);
   return { ok: true, status: 200, oauthMeta, synced };
 }
 
