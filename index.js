@@ -136,7 +136,7 @@ function extractNitroMeta(profile) {
   if (!profile) return { premiumType: 0, nitroMonths: null };
   const premiumType = Number(profile.premium_type ?? profile.user?.premium_type ?? 0);
   const since = profile.premium_since ?? profile.premium_subscription_since ?? profile.user?.premium_since ?? profile.user?.premium_subscription_since ?? null;
-  return { premiumType, nitroMonths: since ? completedMonthsSince(since) : null };
+  return { premiumType, nitroMonths: since ? Math.max(1, completedMonthsSince(since)) : null };
 }
 
 async function syncMember(member, { preserveWhenPresenceMissing = true, oauthMeta = null } = {}) {
@@ -148,7 +148,7 @@ async function syncMember(member, { preserveWhenPresenceMissing = true, oauthMet
   const oauthPremiumType = Number(oauthMeta?.premiumType || 0);
   const premiumType = oauthPremiumType > 0 ? oauthPremiumType : stored.premiumType;
   const nitroMonths = Number(oauthMeta?.nitroMonths || 0) > 0 ? Number(oauthMeta.nitroMonths) : stored.nitroMonths;
-  const boostMonths = member.premiumSince ? completedMonthsSince(member.premiumSince) : 0;
+  const boostMonths = member.premiumSince ? Math.max(1, completedMonthsSince(member.premiumSince)) : 0;
   const serialized = serializePresence(member.presence);
 
   if (serialized) await upsertPresence(user.id, serialized.status, serialized.activities, serialized.spotify, badgesBitfield, premiumType);
