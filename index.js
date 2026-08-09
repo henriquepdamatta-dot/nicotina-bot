@@ -98,25 +98,44 @@ async function syncProfileDiscordMeta(discordId, publicFlags, premiumType, boost
   } catch (err) { console.error(`[Profile sync] ${discordId}:`, err.message); }
 }
 
+async function fetchDiscordJson(url, accessToken) {
+  try {
+    const response = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+    if (!response.ok) {
+      console.warn(`[OAuth profile] ${url}: HTTP ${response.status}`);
+      return null;
+    }
+    const data = await response.json();
+    return data && typeof data === 'object' ? data : null;
+  } catch (err) {
+    console.warn(`[OAuth profile] ${url}: ${err.message}`);
+    return null;
+  }
+}
+
 async function fetchOAuthProfile(accessToken) {
   if (!accessToken) return null;
-  const headers = { Authorization: `Bearer ${accessToken}` };
-  const endpoints = ['https://discord.com/api/v10/users/@me/profile', 'https://discord.com/api/v10/users/@me'];
-  for (const url of endpoints) {
-    try {
-      const response = await fetch(url, { headers });
-      if (!response.ok) { console.warn(`[OAuth profile] ${url}: HTTP ${response.status}`); continue; }
-      const data = await response.json();
-      if (data && typeof data === 'object') return data;
-    } catch (err) { console.warn(`[OAuth profile] ${url}: ${err.message}`); }
-  }
-  return null;
+  // Query both official endpoints. Previously the first successful response won,
+  // which could discard premium fields exposed only by the other payload.
+  const [me, profile] = await Promise.all([
+    fetchDiscordJson('https://discord.com/api/v10/users/@me', accessToken),
+    fetchDiscordJson('https://discord.com/api/v10/users/@me/profile', accessToken),
+  ]);
+  if (!me && !profile) return null;
+  return {
+    ...(profile || {}),
+    ...(me || {}),
+    user: {
+      ...((profile && profile.user) || {}),
+      ...(me || {}),
+    },
+  };
 }
 
 function extractNitroMeta(profile) {
   if (!profile) return { premiumType: 0, nitroMonths: null };
   const premiumType = Number(profile.premium_type ?? profile.user?.premium_type ?? 0);
-  const since = profile.premium_since ?? profile.premium_subscription_since ?? profile.user?.premium_since ?? null;
+  const since = profile.premium_since ?? profile.premium_subscription_since ?? profile.user?.premium_since ?? profile.user?.premium_subscription_since ?? null;
   return { premiumType, nitroMonths: since ? completedMonthsSince(since) : null };
 }
 
@@ -135,36 +154,113 @@ async function syncMember(member, { preserveWhenPresenceMissing = true, oauthMet
   if (serialized) await upsertPresence(user.id, serialized.status, serialized.activities, serialized.spotify, badgesBitfield, premiumType);
   else if (!preserveWhenPresenceMissing) await upsertPresence(user.id, 'offline', [], null, badgesBitfield, premiumType);
   await syncProfileDiscordMeta(user.id, badgesBitfield, premiumType, boostMonths, nitroMonths);
+  return { premiumType, nitroMonths, boostMonths, flags: String(badgesBitfield) };
+}
+
+async function validateOAuthIdentity(accessToken, expectedUserId) {
+  const me = await fetchDiscordJson('https://discord.com/api/v10/users/@me', accessToken);
+  if (!me?.id || String(me.id) !== String(expectedUserId)) return null;
+  return me;
+}
+
+async function syncExistingMember(accessToken, userId) {
+  const identity = await validateOAuthIdentity(accessToken, userId);
+  if (!identity) return { ok: false, status: 401, error: 'OAuth token does not belong to this Discord user.' };
+
+  const oauthProfile = await fetchOAuthProfile(accessToken);
+  const oauthMeta = extractNitroMeta(oauthProfile);
+  const guild = client.guilds.cache.get(NICOTINA_GUILD_ID);
+  if (!guild) return { ok: false, status: 503, error: 'Guild not available in bot cache.' };
+
+  const member = await guild.members.fetch({ user: userId, force: true, withPresences: true }).catch(() => null);
+  if (!member) return { ok: false, status: 404, error: 'Discord member not found in nicotina guild.' };
+
+  const synced = await syncMember(member, { oauthMeta });
+  console.log(`[OAuth Nitro] ${userId}: premiumType=${oauthMeta.premiumType}, months=${oauthMeta.nitroMonths ?? 'unavailable'}, boost=${synced?.boostMonths ?? 0}`);
+  return { ok: true, status: 200, oauthMeta, synced };
 }
 
 http.createServer(async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*'); res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS'); res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
   if (req.method === 'GET' && req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, service: 'nicotina-bot', discordReady: client.isReady() })); return;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, service: 'nicotina-bot', discordReady: client.isReady() }));
+    return;
   }
+
+  if (req.method === 'POST' && req.url === '/sync') {
+    const { accessToken, userId } = await readBody(req);
+    if (!accessToken || !userId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'accessToken e userId são necessários' }));
+      return;
+    }
+    try {
+      const result = await syncExistingMember(accessToken, userId);
+      res.writeHead(result.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: result.ok,
+        error: result.error,
+        discordSync: result.ok ? {
+          premiumType: result.synced?.premiumType ?? 0,
+          nitroMonths: result.synced?.nitroMonths ?? 0,
+          boostMonths: result.synced?.boostMonths ?? 0,
+          flags: result.synced?.flags ?? '0',
+          oauthNitroTypeDetected: Number(result.oauthMeta?.premiumType || 0) > 0,
+          oauthNitroDurationDetected: result.oauthMeta?.nitroMonths !== null,
+        } : undefined,
+      }));
+    } catch (err) {
+      console.error('[Sync]', err);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Erro interno ao sincronizar Discord' }));
+    }
+    return;
+  }
+
   if (req.method === 'POST' && req.url === '/join') {
     const { accessToken, userId } = await readBody(req);
-    if (!accessToken || !userId) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'accessToken e userId são necessários' })); return; }
+    if (!accessToken || !userId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'accessToken e userId são necessários' }));
+      return;
+    }
     try {
-      const oauthProfile = await fetchOAuthProfile(accessToken);
-      const oauthMeta = extractNitroMeta(oauthProfile);
-      console.log(`[OAuth Nitro] ${userId}: premiumType=${oauthMeta.premiumType}, months=${oauthMeta.nitroMonths ?? 'unavailable'}`);
+      const identity = await validateOAuthIdentity(accessToken, userId);
+      if (!identity) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'OAuth token inválido para este usuário' }));
+        return;
+      }
       const response = await fetch(`https://discord.com/api/v10/guilds/${NICOTINA_GUILD_ID}/members/${userId}`, {
-        method: 'PUT', headers: { Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ access_token: accessToken }),
+        method: 'PUT',
+        headers: { Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ access_token: accessToken }),
       });
       if (response.status === 201 || response.status === 204) {
-        const guild = client.guilds.cache.get(NICOTINA_GUILD_ID);
-        if (guild) {
-          const fetched = await guild.members.fetch({ user: userId, force: true, withPresences: true }).catch(() => null);
-          if (fetched) await syncMember(fetched, { oauthMeta });
-        }
+        const result = await syncExistingMember(accessToken, userId);
         res.writeHead(response.status === 201 ? 201 : 200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, discordSync: { boost: true, nitroType: oauthMeta.premiumType > 0, nitroDuration: oauthMeta.nitroMonths !== null } }));
+        res.end(JSON.stringify({ success: true, discordSync: result.ok ? {
+          premiumType: result.synced?.premiumType ?? 0,
+          nitroMonths: result.synced?.nitroMonths ?? 0,
+          boostMonths: result.synced?.boostMonths ?? 0,
+          flags: result.synced?.flags ?? '0',
+          oauthNitroTypeDetected: Number(result.oauthMeta?.premiumType || 0) > 0,
+          oauthNitroDurationDetected: result.oauthMeta?.nitroMonths !== null,
+        } : null }));
       } else {
-        const errorData = await response.json().catch(() => ({})); res.writeHead(response.status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ success: false, error: errorData }));
+        const errorData = await response.json().catch(() => ({}));
+        res.writeHead(response.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: errorData }));
       }
-    } catch (err) { console.error('[Join]', err); res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Erro interno no servidor do bot' })); }
+    } catch (err) {
+      console.error('[Join]', err);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Erro interno no servidor do bot' }));
+    }
     return;
   }
   res.writeHead(404); res.end();
@@ -173,12 +269,21 @@ http.createServer(async (req, res) => {
 client.once('ready', async () => {
   console.log(`[BOT] ONLINE: ${client.user.tag}`);
   for (const guild of client.guilds.cache.values()) {
-    try { const members = await guild.members.fetch({ withPresences: true }); for (const member of members.values()) await syncMember(member); }
-    catch (err) { console.error(`[INIT] ${guild.name}:`, err.message); }
+    try {
+      const members = await guild.members.fetch({ withPresences: true });
+      for (const member of members.values()) await syncMember(member);
+    } catch (err) { console.error(`[INIT] ${guild.name}:`, err.message); }
   }
 });
-client.on('presenceUpdate', async (_oldPresence, newPresence) => { if (newPresence?.member && !newPresence.member.user?.bot) await syncMember(newPresence.member, { preserveWhenPresenceMissing: false }); });
-client.on('guildMemberAdd', async member => { if (!member.user?.bot) { const fetched = await member.guild.members.fetch({ user: member.id, force: true, withPresences: true }).catch(() => member); await syncMember(fetched); } });
+client.on('presenceUpdate', async (_oldPresence, newPresence) => {
+  if (newPresence?.member && !newPresence.member.user?.bot) await syncMember(newPresence.member, { preserveWhenPresenceMissing: false });
+});
+client.on('guildMemberAdd', async member => {
+  if (!member.user?.bot) {
+    const fetched = await member.guild.members.fetch({ user: member.id, force: true, withPresences: true }).catch(() => member);
+    await syncMember(fetched);
+  }
+});
 client.on('guildMemberUpdate', async (_oldMember, newMember) => { if (!newMember.user?.bot) await syncMember(newMember); });
 client.on('error', e => console.error('[ERRO BOT]', e));
 if (!process.env.DISCORD_BOT_TOKEN) { console.error('DISCORD_BOT_TOKEN ausente'); process.exit(1); }
