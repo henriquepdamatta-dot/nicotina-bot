@@ -5,6 +5,8 @@ const { createClient } = require('@supabase/supabase-js');
 
 const PORT = process.env.PORT || 10000;
 const NICOTINA_GUILD_ID = process.env.NICOTINA_GUILD_ID || '1481726829810159671';
+const BOOST_SCAN_CONCURRENCY = 5;
+const BOOST_SCAN_DEADLINE_MS = 20000;
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -99,9 +101,15 @@ async function syncProfileDiscordMeta(discordId, publicFlags, premiumType, boost
   } catch (err) { console.error(`[Profile sync] ${discordId}:`, err.message); }
 }
 
-async function fetchDiscordJson(url, accessToken) {
+async function fetchDiscordJson(url, accessToken, { retryOn429 = true } = {}) {
   try {
     const response = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+    if (response.status === 429 && retryOn429) {
+      const body = await response.json().catch(() => ({}));
+      const waitMs = Math.min(5000, Math.ceil(Number(body?.retry_after || 1) * 1000));
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+      return fetchDiscordJson(url, accessToken, { retryOn429: false });
+    }
     if (!response.ok) {
       console.warn(`[OAuth profile] ${url}: HTTP ${response.status}`);
       return null;
@@ -131,6 +139,32 @@ async function fetchOAuthProfile(accessToken) {
       ...(me || {}),
     },
   };
+}
+
+// O Discord nao expoe boost global: premium_since existe apenas no membro de cada guild.
+// Para honrar o badge "Server Boosting" de quem impulsiona qualquer servidor, varremos as
+// guilds do usuario (scopes guilds + guilds.members.read) e ficamos com a data mais antiga.
+async function fetchGlobalBoostMonths(accessToken) {
+  const guilds = await fetchDiscordJson('https://discord.com/api/v10/users/@me/guilds', accessToken);
+  if (!Array.isArray(guilds) || guilds.length === 0) return null;
+
+  const guildIds = guilds.map(guild => guild?.id).filter(Boolean);
+  const deadline = Date.now() + BOOST_SCAN_DEADLINE_MS;
+  let earliest = null;
+  let cursor = 0;
+
+  const scan = async () => {
+    while (cursor < guildIds.length && Date.now() < deadline) {
+      const guildId = guildIds[cursor++];
+      const member = await fetchDiscordJson(`https://discord.com/api/v10/users/@me/guilds/${guildId}/member`, accessToken);
+      const since = member?.premium_since ? new Date(member.premium_since).getTime() : NaN;
+      if (!Number.isNaN(since) && (earliest === null || since < earliest)) earliest = since;
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(BOOST_SCAN_CONCURRENCY, guildIds.length) }, scan));
+
+  if (cursor < guildIds.length) console.warn(`[Boost scan] parcial: ${cursor}/${guildIds.length} guilds no prazo`);
+  return earliest === null ? null : Math.max(1, completedMonthsSince(new Date(earliest)));
 }
 
 function extractPremiumMeta(profile) {
@@ -182,6 +216,8 @@ async function syncExistingMember(accessToken, userId) {
 
   const oauthProfile = await fetchOAuthProfile(accessToken);
   const oauthMeta = extractPremiumMeta(oauthProfile);
+  // premium_guild_since so aparece no endpoint de cliente; via OAuth caimos na varredura.
+  if (!oauthMeta.boostMonths) oauthMeta.boostMonths = await fetchGlobalBoostMonths(accessToken);
   const guild = client.guilds.cache.get(NICOTINA_GUILD_ID);
   if (!guild) return { ok: false, status: 503, error: 'Guild not available in bot cache.' };
 
