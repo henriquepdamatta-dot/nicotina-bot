@@ -5,8 +5,11 @@ const { createClient } = require('@supabase/supabase-js');
 
 const PORT = process.env.PORT || 10000;
 const NICOTINA_GUILD_ID = process.env.NICOTINA_GUILD_ID || '1481726829810159671';
-const SCAN_CONCURRENCY = 5;
-const SCAN_DEADLINE_MS = 20000;
+// /users/@me/guilds/{id}/member tem limite por token bem apertado: em paralelo o
+// Discord devolve 429 em todas as chamadas. Sequencial e espacado, ele responde.
+const SCAN_CONCURRENCY = 1;
+const SCAN_SPACING_MS = 350;
+const SCAN_DEADLINE_MS = 45000;
 const NITRO_GENERIC = 2; // premium_type "Nitro": tier exato exige scope de parceiro.
 
 function readBody(req) { return new Promise((resolve,reject)=>{let body='';req.on('data',c=>body+=c);req.on('end',()=>{try{resolve(JSON.parse(body))}catch{resolve({})}});req.on('error',reject);}); }
@@ -19,8 +22,33 @@ function normalizeSpotifyAsset(raw){if(!raw)return null;if(!raw.startsWith('spot
 function serializePresence(presence){if(!presence)return null;let spotify=null;const activities=[];for(const a of presence.activities||[]){if(a.name==='Spotify'||a.type===2){spotify={title:a.details||'',artist:a.state||'',album:normalizeSpotifyAsset(a.assets?.largeImage||null),albumName:a.assets?.largeText||'',trackId:a.syncId||null,timestamps:a.timestamps?{start:a.timestamps.start?.getTime?.()??0,end:a.timestamps.end?.getTime?.()??0}:{start:0,end:0}};continue;}activities.push({id:a.id||a.name,name:a.name,details:a.details||'',state:a.state||'',type:a.type,application_id:a.applicationId||null,assets:a.assets?{large_image:a.assets.largeImage||null,large_text:a.assets.largeText||null,small_image:a.assets.smallImage||null,small_text:a.assets.smallText||null}:null,timestamps:a.timestamps?{start:a.timestamps.start?.getTime?.()??null,end:a.timestamps.end?.getTime?.()??null}:null});}return{status:presence.status||'offline',spotify,activities};}
 async function getStoredPremiumMeta(id){const[{data:p},{data:s}]=await Promise.all([supabase.from('user_presence').select('nitro_type').eq('discord_id',id).maybeSingle(),supabase.from('social_profiles').select('premium_type, discord_nitro_months, discord_boost_months').eq('public_discord_id',id).maybeSingle()]);return{premiumType:Math.max(Number(p?.nitro_type||0),Number(s?.premium_type||0)),nitroMonths:Number(s?.discord_nitro_months||0),boostMonths:Number(s?.discord_boost_months||0)};}
 async function upsertPresence(id,status,activities,spotify,flags,nitro){const{error}=await supabase.from('user_presence').upsert({discord_id:id,status,badges_bitfield:String(flags),nitro_type:Math.max(0,Number(nitro||0)),spotify,activities,updated_at:new Date().toISOString()},{onConflict:'discord_id'});if(error)console.error('[Presence]',error.message);}
-async function syncProfileDiscordMeta(id,flags,premiumType,boostMonths,nitroMonths){try{const{error:rpcError}=await supabase.rpc('bot_sync_discord_badges',{p_discord_id:id,p_public_flags:String(flags||0),p_premium_type:Number(premiumType||0)});if(rpcError&&!rpcError.message?.includes('No rows'))console.error('[Profile flags]',rpcError.message);const patch={discord_boost_months:Math.max(0,Number(boostMonths||0))};if(Number(nitroMonths)>0)patch.discord_nitro_months=Math.floor(Number(nitroMonths));if(Number(premiumType)>0)patch.premium_type=Number(premiumType);const{error}=await supabase.from('social_profiles').update(patch).eq('public_discord_id',id);if(error)console.error('[Profile metadata]',error.message);}catch(e){console.error('[Profile sync]',e.message);}}
-async function fetchDiscordJson(url,accessToken,{retryOn429=true}={}){try{const response=await fetch(url,{headers:{Authorization:`Bearer ${accessToken}`}});if(response.status===429&&retryOn429){const body=await response.json().catch(()=>({}));await new Promise(r=>setTimeout(r,Math.min(5000,Math.ceil(Number(body?.retry_after||1)*1000))));return fetchDiscordJson(url,accessToken,{retryOn429:false});}if(!response.ok){console.warn(`[OAuth] ${url}: HTTP ${response.status}`);return null;}const data=await response.json();return data&&typeof data==='object'?data:null;}catch(e){console.warn(`[OAuth] ${url}: ${e.message}`);return null;}}
+async function syncProfileDiscordMeta(id,flags,premiumType,boostMonths,nitroMonths){try{
+  // O banco tem duas versoes de bot_sync_discord_badges e o Postgres nao consegue
+  // escolher entre elas com 3 argumentos ("could not choose the best candidate
+  // function"), o que fazia a chamada falhar sempre. Os 5 nomes casam so com uma.
+  const{error:rpcError}=await supabase.rpc('bot_sync_discord_badges',{p_discord_id:id,p_public_flags:String(flags||0),p_premium_type:Number(premiumType||0),p_nitro_months:Math.max(0,Math.floor(Number(nitroMonths||0))),p_boost_months:Math.max(0,Math.floor(Number(boostMonths||0)))});if(rpcError&&!rpcError.message?.includes('No rows'))console.error('[Profile flags]',rpcError.message);const patch={discord_boost_months:Math.max(0,Number(boostMonths||0))};if(Number(nitroMonths)>0)patch.discord_nitro_months=Math.floor(Number(nitroMonths));if(Number(premiumType)>0)patch.premium_type=Number(premiumType);const{error}=await supabase.from('social_profiles').update(patch).eq('public_discord_id',id);if(error)console.error('[Profile metadata]',error.message);}catch(e){console.error('[Profile sync]',e.message);}}
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function fetchDiscordJson(url,accessToken,{retries=4}={}){
+  for(let attempt=0;attempt<=retries;attempt++){
+    try{
+      const response=await fetch(url,{headers:{Authorization:`Bearer ${accessToken}`}});
+      if(response.status===429){
+        const body=await response.json().catch(()=>({}));
+        if(attempt===retries){console.warn(`[OAuth] ${url}: 429 apos ${retries+1} tentativas`);return null;}
+        // retry_after vem em segundos; a folga evita bater no limite de novo.
+        await sleep(Math.min(10000,Math.ceil(Number(body?.retry_after||1)*1000)+250));
+        continue;
+      }
+      if(!response.ok){console.warn(`[OAuth] ${url}: HTTP ${response.status}`);return null;}
+      const data=await response.json();
+      return data&&typeof data==='object'?data:null;
+    }catch(e){
+      if(attempt===retries){console.warn(`[OAuth] ${url}: ${e.message}`);return null;}
+      await sleep(500);
+    }
+  }
+  return null;
+}
 async function validateOAuthIdentity(accessToken,expectedUserId){const me=await fetchDiscordJson('https://discord.com/api/v10/users/@me',accessToken);return me?.id&&String(me.id)===String(expectedUserId)?me:null;}
 
 // premium_type (Nitro) exige o scope identify.premium, restrito a parceiros aprovados.
@@ -45,17 +73,20 @@ async function scanGuildsForPremium(accessToken){
   if(!Array.isArray(guilds)||guilds.length===0)return{boostMonths:null,nitroSource:null,scanned:0,total:0};
   const ids=guilds.map(g=>g?.id).filter(Boolean);
   const deadline=Date.now()+SCAN_DEADLINE_MS;
-  let earliestBoost=null,nitroSource=null,cursor=0;
+  let earliestBoost=null,nitroSource=null,cursor=0,answered=0;
   const scan=async()=>{
     while(cursor<ids.length&&Date.now()<deadline){
-      const member=await fetchDiscordJson(`https://discord.com/api/v10/users/@me/guilds/${ids[cursor++]}/member`,accessToken);
+      const index=cursor++;
+      if(index>0)await sleep(SCAN_SPACING_MS);
+      const member=await fetchDiscordJson(`https://discord.com/api/v10/users/@me/guilds/${ids[index]}/member`,accessToken);
+      if(member)answered++;
       const since=member?.premium_since?new Date(member.premium_since).getTime():NaN;
       if(!Number.isNaN(since)&&(earliestBoost===null||since<earliestBoost))earliestBoost=since;
       if(!nitroSource)nitroSource=detectNitroFromMember(member);
     }
   };
   await Promise.all(Array.from({length:Math.min(SCAN_CONCURRENCY,ids.length)},scan));
-  return{boostMonths:earliestBoost===null?null:Math.max(1,completedMonthsSince(new Date(earliestBoost))),nitroSource,scanned:cursor,total:ids.length};
+  return{boostMonths:earliestBoost===null?null:Math.max(1,completedMonthsSince(new Date(earliestBoost))),nitroSource,scanned:cursor,answered,total:ids.length};
 }
 
 async function syncMember(member,{preserveWhenPresenceMissing=true,oauth=null}={}){if(!member||member.user?.bot)return null;const user=member.user;if(!user.flags&&typeof user.fetchFlags==='function')await user.fetchFlags().catch(()=>null);
@@ -75,12 +106,12 @@ async function syncByDiscordId(userId,accessToken){if(!/^\d{17,20}$/.test(String
   if(accessToken){
     if(!await validateOAuthIdentity(accessToken,userId))return{ok:false,status:401,error:'Autorização do Discord não pertence a esta conta.'};
     oauth=await scanGuildsForPremium(accessToken);
-    console.log(`[Scan] ${userId}: ${oauth.scanned}/${oauth.total} guilds, boost=${oauth.boostMonths??'nenhum'}, nitro=${oauth.nitroSource??'nao detectado'}`);
+    console.log(`[Scan] ${userId}: ${oauth.answered}/${oauth.total} guilds responderam (${oauth.scanned} tentadas), boost=${oauth.boostMonths??'nenhum'}, nitro=${oauth.nitroSource??'nao detectado'}`);
   }
   const synced=await syncMember(member,{preserveWhenPresenceMissing:false,oauth});
   // total=0 com token significa que /users/@me/guilds falhou: quase sempre o token
   // foi emitido antes do scope guilds, entao o site precisa reautorizar.
-  const scan=oauth?{guildsVisiveis:oauth.total,guildsVarridas:oauth.scanned,boostEncontrado:oauth.boostMonths,nitroEncontrado:oauth.nitroSource,escopoGuildsOk:oauth.total>0}:null;
+  const scan=oauth?{guildsVisiveis:oauth.total,guildsVarridas:oauth.scanned,guildsResponderam:oauth.answered,boostEncontrado:oauth.boostMonths,nitroEncontrado:oauth.nitroSource,escopoGuildsOk:oauth.total>0,bloqueadoPorRateLimit:oauth.total>0&&oauth.answered===0}:null;
   return{ok:true,status:200,synced,oauthUsed:Boolean(accessToken),scan};}
 
 http.createServer(async(req,res)=>{res.setHeader('Access-Control-Allow-Origin','*');res.setHeader('Access-Control-Allow-Methods','GET, POST, OPTIONS');res.setHeader('Access-Control-Allow-Headers','Content-Type');if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}if(req.method==='GET'&&req.url==='/'){res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({ok:true,service:'nicotina-bot',discordReady:client.isReady()}));return;}if(req.method==='POST'&&req.url==='/sync'){const{userId,accessToken}=await readBody(req);try{const result=await syncByDiscordId(userId,accessToken);res.writeHead(result.status,{'Content-Type':'application/json'});res.end(JSON.stringify({success:result.ok,error:result.error,oauthUsed:result.oauthUsed,scan:result.scan,discordSync:result.synced||null}));}catch(e){console.error('[Sync]',e);res.writeHead(500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:'Erro interno ao sincronizar Discord'}));}return;}res.writeHead(404);res.end();}).listen(PORT,'0.0.0.0',()=>console.log(`[WEB] porta ${PORT}`));
