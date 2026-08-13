@@ -34,9 +34,11 @@ async function fetchDiscordJson(url,accessToken,{retries=4}={}){
       const response=await fetch(url,{headers:{Authorization:`Bearer ${accessToken}`}});
       if(response.status===429){
         const body=await response.json().catch(()=>({}));
-        if(attempt===retries){console.warn(`[OAuth] ${url}: 429 apos ${retries+1} tentativas`);return null;}
-        // retry_after vem em segundos; a folga evita bater no limite de novo.
-        await sleep(Math.min(10000,Math.ceil(Number(body?.retry_after||1)*1000)+250));
+        const espera=Math.min(10000,Math.ceil(Number(body?.retry_after||1)*1000)+250);
+        // Um limite global significa que a conta inteira esta contida: insistir so piora.
+        if(body?.global){console.warn(`[OAuth] 429 GLOBAL, espera ${espera}ms - varredura abortada`);return null;}
+        if(attempt===retries){console.warn(`[OAuth] ${url}: 429 apos ${retries+1} tentativas (ultima espera ${espera}ms)`);return null;}
+        await sleep(espera);
         continue;
       }
       if(!response.ok){console.warn(`[OAuth] ${url}: HTTP ${response.status}`);return null;}
