@@ -7,7 +7,6 @@ const PORT = process.env.PORT || 10000;
 const NICOTINA_GUILD_ID = process.env.NICOTINA_GUILD_ID || '1481726829810159671';
 const SCAN_SPACING_MS = 350;
 const SCAN_DEADLINE_MS = 45000;
-const NITRO_GENERIC = 2;
 
 const DISCORD_BADGE_FLAGS = [
   { bit: 0, key: 'staff', label: 'Discord Staff' },
@@ -71,23 +70,27 @@ function serializePresence(presence) {
 async function getStoredPremiumMeta(id) {
   const [{ data: p }, { data: s }] = await Promise.all([
     supabase.from('user_presence').select('nitro_type,badges_bitfield').eq('discord_id', id).maybeSingle(),
-    supabase.from('social_profiles').select('premium_type,discord_nitro_months,discord_boost_months,discord_public_flags').eq('public_discord_id', id).maybeSingle(),
+    supabase.from('social_profiles').select('premium_type,discord_nitro_months,discord_boost_months,discord_boost_since,public_flags').eq('public_discord_id', id).maybeSingle(),
   ]);
-  return { premiumType: Math.max(Number(p?.nitro_type || 0), Number(s?.premium_type || 0)), nitroMonths: Number(s?.discord_nitro_months || 0), boostMonths: Number(s?.discord_boost_months || 0), flags: String(s?.discord_public_flags ?? p?.badges_bitfield ?? '0') };
+  return { premiumType: Math.max(Number(p?.nitro_type || 0), Number(s?.premium_type || 0)), nitroMonths: Number(s?.discord_nitro_months || 0), boostMonths: Number(s?.discord_boost_months || 0), boostSince: s?.discord_boost_since || null, flags: String(s?.public_flags ?? p?.badges_bitfield ?? '0') };
 }
 async function upsertPresence(id, status, activities, spotify, flags, nitro) {
   const { error } = await supabase.from('user_presence').upsert({ discord_id: id, status, badges_bitfield: String(flags), nitro_type: Math.max(0, Number(nitro || 0)), spotify, activities, updated_at: new Date().toISOString() }, { onConflict: 'discord_id' });
   if (error) console.error('[Presence]', error.message);
 }
-async function syncProfileDiscordMeta(id, flags, premiumType, boostMonths, nitroMonths) {
+async function syncProfileDiscordMeta(id, flags, premiumType, boostMonths, nitroMonths, boostSince, premiumAuthoritative = false) {
   try {
-    const { error: rpcError } = await supabase.rpc('bot_sync_discord_badges', { p_discord_id: id, p_public_flags: String(flags || 0), p_premium_type: Number(premiumType || 0), p_nitro_months: Math.max(0, Math.floor(Number(nitroMonths || 0))), p_boost_months: Math.max(0, Math.floor(Number(boostMonths || 0))) });
+    const params = {
+      p_discord_id: id,
+      p_public_flags: String(flags || 0),
+      p_premium_type: Number(premiumType || 0),
+      p_nitro_months: Math.max(0, Math.floor(Number(nitroMonths || 0))),
+      p_boost_months: Math.max(0, Math.floor(Number(boostMonths || 0))),
+      p_boost_since: boostSince || null,
+      p_premium_authoritative: Boolean(premiumAuthoritative),
+    };
+    const { error: rpcError } = await supabase.rpc('bot_sync_discord_badges', params);
     if (rpcError && !rpcError.message?.includes('No rows')) console.error('[Profile flags]', rpcError.message);
-    const patch = { discord_boost_months: Math.max(0, Number(boostMonths || 0)) };
-    if (Number(nitroMonths) > 0) patch.discord_nitro_months = Math.floor(Number(nitroMonths));
-    if (Number(premiumType) > 0) patch.premium_type = Number(premiumType);
-    const { error } = await supabase.from('social_profiles').update(patch).eq('public_discord_id', id);
-    if (error) console.error('[Profile metadata]', error.message);
   } catch (e) { console.error('[Profile sync]', e.message); }
 }
 async function fetchDiscordJson(url, accessToken, retries = 4) {
@@ -111,33 +114,19 @@ async function validateOAuthIdentity(accessToken, expectedUserId) {
   const me = await fetchDiscordJson('https://discord.com/api/v10/users/@me', accessToken);
   return me?.id && String(me.id) === String(expectedUserId) ? me : null;
 }
-function detectNitroFromAssets(user) {
-  if (typeof user?.avatar === 'string' && user.avatar.startsWith('a_')) return 'avatar animado';
-  if (typeof user?.banner === 'string' && user.banner.startsWith('a_')) return 'banner animado';
-  return null;
-}
-function detectNitroFromMember(member) {
-  if (member?.avatar) return 'avatar por servidor';
-  if (member?.banner) return 'banner por servidor';
-  return null;
-}
-async function scanGuildsForPremium(accessToken) {
-  const guilds = await fetchDiscordJson('https://discord.com/api/v10/users/@me/guilds', accessToken);
-  if (!Array.isArray(guilds) || !guilds.length) return { boostMonths: null, nitroSource: null, scanned: 0, answered: 0, total: 0 };
-  const deadline = Date.now() + SCAN_DEADLINE_MS;
-  let earliestBoost = null, nitroSource = null, scanned = 0, answered = 0;
-  for (const guild of guilds) {
-    if (Date.now() >= deadline) break;
-    if (scanned) await sleep(SCAN_SPACING_MS);
-    scanned++;
-    const member = await fetchDiscordJson(`https://discord.com/api/v10/users/@me/guilds/${guild.id}/member`, accessToken);
-    if (!member) continue;
-    answered++;
-    const since = member.premium_since ? new Date(member.premium_since).getTime() : NaN;
-    if (!Number.isNaN(since) && (earliestBoost === null || since < earliestBoost)) earliestBoost = since;
-    if (!nitroSource) nitroSource = detectNitroFromMember(member);
-  }
-  return { boostMonths: earliestBoost === null ? null : Math.max(1, completedMonthsSince(new Date(earliestBoost))), nitroSource, scanned, answered, total: guilds.length };
+async function getOAuthIdentity(accessToken, expectedUserId) {
+  const [me, authorization] = await Promise.all([
+    fetchDiscordJson('https://discord.com/api/v10/users/@me', accessToken),
+    fetchDiscordJson('https://discord.com/api/v10/oauth2/@me', accessToken),
+  ]);
+  if (!me?.id || String(me.id) !== String(expectedUserId)) return null;
+  const scopes = Array.isArray(authorization?.scopes) ? authorization.scopes : [];
+  const premiumAuthoritative = scopes.includes('identify.premium');
+  return {
+    user: me,
+    premiumAuthoritative,
+    premiumType: premiumAuthoritative ? Math.max(0, Number(me.premium_type || 0)) : null,
+  };
 }
 async function syncMember(member, { preserveWhenPresenceMissing = true, oauth = null } = {}) {
   if (!member || member.user?.bot) return null;
@@ -146,16 +135,15 @@ async function syncMember(member, { preserveWhenPresenceMissing = true, oauth = 
   const fullUser = await user.fetch(true).catch(() => user);
   const flags = BigInt(fullUser.flags?.bitfield ?? user.flags?.bitfield ?? 0);
   const stored = await getStoredPremiumMeta(user.id);
-  const nitroSource = detectNitroFromAssets({ avatar: fullUser.avatar, banner: fullUser.banner }) || detectNitroFromMember({ avatar: member.avatar, banner: member.banner }) || oauth?.nitroSource || null;
-  const premiumType = Math.max(Number(oauth?.premiumType || 0), nitroSource ? NITRO_GENERIC : 0, stored.premiumType);
-  const guildBoost = member.premiumSince ? Math.max(1, completedMonthsSince(member.premiumSince)) : 0;
-  const freshBoost = Math.max(guildBoost, Number(oauth?.boostMonths || 0));
-  const boostMonths = freshBoost > 0 ? freshBoost : stored.boostMonths;
+  const premiumAuthoritative = Boolean(oauth?.premiumAuthoritative);
+  const premiumType = premiumAuthoritative ? Number(oauth.premiumType || 0) : stored.premiumType;
+  const boostSince = member.premiumSince ? member.premiumSince.toISOString() : null;
+  const boostMonths = boostSince ? Math.max(1, completedMonthsSince(boostSince)) : 0;
   const serialized = serializePresence(member.presence);
   if (serialized) await upsertPresence(user.id, serialized.status, serialized.activities, serialized.spotify, flags, premiumType);
   else if (!preserveWhenPresenceMissing) await upsertPresence(user.id, 'offline', [], null, flags, premiumType);
-  await syncProfileDiscordMeta(user.id, flags, premiumType, boostMonths, stored.nitroMonths);
-  return { premiumType, nitroMonths: stored.nitroMonths, boostMonths, flags: String(flags), nitroSource };
+  await syncProfileDiscordMeta(user.id, flags, premiumType, boostMonths, stored.nitroMonths, boostSince, premiumAuthoritative);
+  return { premiumType, nitroMonths: stored.nitroMonths, boostMonths, boostSince, flags: String(flags), premiumAuthoritative };
 }
 async function syncByDiscordId(userId, accessToken) {
   if (!/^\d{17,20}$/.test(String(userId || ''))) return { ok: false, status: 400, error: 'Discord ID inválido.' };
@@ -166,13 +154,17 @@ async function syncByDiscordId(userId, accessToken) {
   if (!member) return { ok: false, status: 404, error: 'Sua conta Discord ainda não está no servidor do nicotina.lol.' };
   let oauth = null;
   if (accessToken) {
-    const me = await validateOAuthIdentity(accessToken, userId);
-    if (!me) return { ok: false, status: 401, error: 'Autorização do Discord não pertence a esta conta.' };
-    oauth = await scanGuildsForPremium(accessToken);
-    oauth.premiumType = Number(me.premium_type || 0);
+    oauth = await getOAuthIdentity(accessToken, userId);
+    if (!oauth) return { ok: false, status: 401, error: 'Autorização do Discord não pertence a esta conta.' };
   }
   const synced = await syncMember(member, { preserveWhenPresenceMissing: false, oauth });
-  return { ok: true, status: 200, synced, oauthUsed: Boolean(accessToken), scan: oauth ? { guildsVisiveis: oauth.total, guildsVarridas: oauth.scanned, guildsResponderam: oauth.answered, boostEncontrado: oauth.boostMonths, nitroEncontrado: oauth.premiumType || oauth.nitroSource, escopoGuildsOk: oauth.total > 0, bloqueadoPorRateLimit: oauth.total > 0 && oauth.answered === 0 } : null };
+  return {
+    ok: true,
+    status: 200,
+    synced,
+    oauthUsed: Boolean(accessToken),
+    nitroAvailable: Boolean(oauth?.premiumAuthoritative),
+  };
 }
 function boosterStage(months) {
   const m = Math.max(0, Number(months || 0));
@@ -199,7 +191,7 @@ http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/') { sendJson(res, 200, { ok: true, service: 'nicotina-bot', discordReady: client.isReady(), badgeApi: 1 }); return; }
   if (req.method === 'POST' && req.url === '/sync') {
     const { userId, accessToken } = await readBody(req);
-    try { const result = await syncByDiscordId(userId, accessToken); sendJson(res, result.status, { success: result.ok, error: result.error, oauthUsed: result.oauthUsed, scan: result.scan, discordSync: result.synced || null }); }
+    try { const result = await syncByDiscordId(userId, accessToken); sendJson(res, result.status, { success: result.ok, error: result.error, oauthUsed: result.oauthUsed, nitroAvailable: result.nitroAvailable, discordSync: result.synced || null }); }
     catch (e) { console.error('[Sync]', e); sendJson(res, 500, { error: 'Erro interno ao sincronizar Discord' }); }
     return;
   }
