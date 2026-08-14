@@ -124,10 +124,49 @@ async function getOAuthIdentity(accessToken, expectedUserId) {
   const premiumAuthoritative = scopes.includes('identify.premium');
   return {
     user: me,
+    scopes,
     premiumAuthoritative,
     premiumType: premiumAuthoritative ? Math.max(0, Number(me.premium_type || 0)) : null,
   };
 }
+
+async function scanAuthorizedGuildBoosts(accessToken) {
+  const guilds = await fetchDiscordJson('https://discord.com/api/v10/users/@me/guilds', accessToken);
+  if (!Array.isArray(guilds)) return { ok: false, complete: false, boostSince: null, total: 0, scanned: 0, answered: 0 };
+
+  const deadline = Date.now() + SCAN_DEADLINE_MS;
+  let earliestBoost = null;
+  let scanned = 0;
+  let answered = 0;
+  const batchSize = 5;
+
+  for (let offset = 0; offset < guilds.length && Date.now() < deadline; offset += batchSize) {
+    const batch = guilds.slice(offset, offset + batchSize);
+    const members = await Promise.all(batch.map(guild =>
+      fetchDiscordJson(`https://discord.com/api/v10/users/@me/guilds/${guild.id}/member`, accessToken)
+    ));
+    scanned += batch.length;
+    for (const member of members) {
+      if (!member) continue;
+      answered++;
+      const timestamp = member.premium_since ? new Date(member.premium_since).getTime() : NaN;
+      if (!Number.isNaN(timestamp) && (earliestBoost === null || timestamp < earliestBoost)) {
+        earliestBoost = timestamp;
+      }
+    }
+    if (offset + batchSize < guilds.length) await sleep(SCAN_SPACING_MS);
+  }
+
+  return {
+    ok: true,
+    complete: scanned >= guilds.length,
+    boostSince: earliestBoost === null ? null : new Date(earliestBoost).toISOString(),
+    total: guilds.length,
+    scanned,
+    answered,
+  };
+}
+
 async function syncMember(member, { preserveWhenPresenceMissing = true, oauth = null } = {}) {
   if (!member || member.user?.bot) return null;
   const user = member.user;
@@ -137,7 +176,9 @@ async function syncMember(member, { preserveWhenPresenceMissing = true, oauth = 
   const stored = await getStoredPremiumMeta(user.id);
   const premiumAuthoritative = Boolean(oauth?.premiumAuthoritative);
   const premiumType = premiumAuthoritative ? Number(oauth.premiumType || 0) : stored.premiumType;
-  const boostSince = member.premiumSince ? member.premiumSince.toISOString() : null;
+  const boostWasFound = Boolean(oauth?.boostSince);
+  const boostScanComplete = Boolean(oauth?.boostScanComplete);
+  const boostSince = boostWasFound ? oauth.boostSince : boostScanComplete ? null : stored.boostSince;
   const boostMonths = boostSince ? Math.max(1, completedMonthsSince(boostSince)) : 0;
   const serialized = serializePresence(member.presence);
   if (serialized) await upsertPresence(user.id, serialized.status, serialized.activities, serialized.spotify, flags, premiumType);
@@ -152,18 +193,28 @@ async function syncByDiscordId(userId, accessToken) {
   if (!guild) return { ok: false, status: 503, error: 'Servidor do nicotina.lol indisponível para o bot.' };
   const member = await guild.members.fetch({ user: String(userId), force: true, withPresences: true }).catch(() => null);
   if (!member) return { ok: false, status: 404, error: 'Sua conta Discord ainda não está no servidor do nicotina.lol.' };
-  let oauth = null;
-  if (accessToken) {
-    oauth = await getOAuthIdentity(accessToken, userId);
-    if (!oauth) return { ok: false, status: 401, error: 'Autorização do Discord não pertence a esta conta.' };
+  if (!accessToken) {
+    return { ok: false, status: 401, error: 'Autorize novamente o Discord para procurar Boost em seus servidores.' };
   }
+  const oauth = await getOAuthIdentity(accessToken, userId);
+  if (!oauth) return { ok: false, status: 401, error: 'Autorização do Discord não pertence a esta conta.' };
+  if (!oauth.scopes.includes('guilds') || !oauth.scopes.includes('guilds.members.read')) {
+    return { ok: false, status: 403, error: 'Autorize os acessos guilds e guilds.members.read para localizar sua insígnia de Boost.' };
+  }
+  const boostScan = await scanAuthorizedGuildBoosts(accessToken);
+  if (!boostScan.ok) {
+    return { ok: false, status: 502, error: 'O Discord não liberou a consulta dos seus servidores agora. Tente sincronizar novamente.' };
+  }
+  oauth.boostSince = boostScan.boostSince;
+  oauth.boostScanComplete = boostScan.complete;
   const synced = await syncMember(member, { preserveWhenPresenceMissing: false, oauth });
   return {
     ok: true,
     status: 200,
     synced,
-    oauthUsed: Boolean(accessToken),
-    nitroAvailable: Boolean(oauth?.premiumAuthoritative),
+    oauthUsed: true,
+    nitroAvailable: Boolean(oauth.premiumAuthoritative),
+    scan: boostScan,
   };
 }
 function boosterStage(months) {
@@ -178,8 +229,8 @@ function flagsToBadges(flagsValue) {
 async function getNormalizedDiscordBadges(userId) {
   const stored = await getStoredPremiumMeta(userId);
   const badges = flagsToBadges(stored.flags);
-  if (stored.premiumType > 0) badges.push({ key: stored.premiumType === 3 ? 'nitro_basic' : 'nitro', label: stored.premiumType === 3 ? 'Discord Nitro Basic' : 'Discord Nitro', premiumType: stored.premiumType, months: stored.nitroMonths, source: stored.premiumType === NITRO_GENERIC ? 'inferred' : 'discord_oauth' });
-  if (stored.boostMonths > 0) badges.push({ key: 'server_booster', label: 'Server Booster', months: stored.boostMonths, stage: boosterStage(stored.boostMonths), source: 'discord_guild_membership' });
+  if (stored.premiumType > 0) badges.push({ key: stored.premiumType === 3 ? 'nitro_basic' : 'nitro', label: stored.premiumType === 3 ? 'Discord Nitro Basic' : 'Discord Nitro', premiumType: stored.premiumType, months: stored.nitroMonths, source: 'discord_oauth' });
+  if (stored.boostMonths > 0) badges.push({ key: 'server_booster', label: 'Server Booster', months: stored.boostMonths, stage: boosterStage(stored.boostMonths), source: 'discord_oauth_guild_membership' });
   return { userId: String(userId), badges, meta: stored };
 }
 
@@ -191,7 +242,7 @@ http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/') { sendJson(res, 200, { ok: true, service: 'nicotina-bot', discordReady: client.isReady(), badgeApi: 1 }); return; }
   if (req.method === 'POST' && req.url === '/sync') {
     const { userId, accessToken } = await readBody(req);
-    try { const result = await syncByDiscordId(userId, accessToken); sendJson(res, result.status, { success: result.ok, error: result.error, oauthUsed: result.oauthUsed, nitroAvailable: result.nitroAvailable, discordSync: result.synced || null }); }
+    try { const result = await syncByDiscordId(userId, accessToken); sendJson(res, result.status, { success: result.ok, error: result.error, oauthUsed: result.oauthUsed, nitroAvailable: result.nitroAvailable, scan: result.scan || null, discordSync: result.synced || null }); }
     catch (e) { console.error('[Sync]', e); sendJson(res, 500, { error: 'Erro interno ao sincronizar Discord' }); }
     return;
   }
