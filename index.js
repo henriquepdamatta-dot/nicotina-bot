@@ -70,9 +70,9 @@ function serializePresence(presence) {
 async function getStoredPremiumMeta(id) {
   const [{ data: p }, { data: s }] = await Promise.all([
     supabase.from('user_presence').select('nitro_type,badges_bitfield').eq('discord_id', id).maybeSingle(),
-    supabase.from('social_profiles').select('premium_type,discord_nitro_months,discord_boost_months,discord_boost_since,discord_public_flags').eq('public_discord_id', id).maybeSingle(),
+    supabase.from('social_profiles').select('premium_type,discord_nitro_months,discord_boost_months,discord_boost_since,public_flags').eq('public_discord_id', id).maybeSingle(),
   ]);
-  return { premiumType: Math.max(Number(p?.nitro_type || 0), Number(s?.premium_type || 0)), nitroMonths: Number(s?.discord_nitro_months || 0), boostMonths: Number(s?.discord_boost_months || 0), boostSince: s?.discord_boost_since || null, flags: String(s?.discord_public_flags ?? p?.badges_bitfield ?? '0') };
+  return { premiumType: Math.max(Number(p?.nitro_type || 0), Number(s?.premium_type || 0)), nitroMonths: Number(s?.discord_nitro_months || 0), boostMonths: Number(s?.discord_boost_months || 0), boostSince: s?.discord_boost_since || null, flags: String(s?.public_flags ?? p?.badges_bitfield ?? '0') };
 }
 async function upsertPresence(id, status, activities, spotify, flags, nitro) {
   const { error } = await supabase.from('user_presence').upsert({ discord_id: id, status, badges_bitfield: String(flags), nitro_type: Math.max(0, Number(nitro || 0)), spotify, activities, updated_at: new Date().toISOString() }, { onConflict: 'discord_id' });
