@@ -27,6 +27,9 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) process
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildPresences, GatewayIntentBits.GuildMembers] });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+// Último problema de conexão com o Discord, mostrado em GET / pra dar pra diagnosticar sem abrir os logs.
+let lastDiscordError = null;
+const noteDiscordError = (where, e) => { lastDiscordError = { where, message: String(e?.message || e), at: new Date().toISOString() }; console.error(`[${where}]`, e); };
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -239,7 +242,7 @@ http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
-  if (req.method === 'GET' && req.url === '/') { sendJson(res, 200, { ok: true, service: 'nicotina-bot', discordReady: client.isReady(), badgeApi: 1 }); return; }
+  if (req.method === 'GET' && req.url === '/') { sendJson(res, 200, { ok: true, service: 'nicotina-bot', discordReady: client.isReady(), badgeApi: 1, supabaseProject: (process.env.SUPABASE_URL || '').replace(/^https:\/\//, '').split('.')[0], lastDiscordError }); return; }
   if (req.method === 'POST' && req.url === '/sync') {
     const { userId, accessToken } = await readBody(req);
     try { const result = await syncByDiscordId(userId, accessToken); sendJson(res, result.status, { success: result.ok, error: result.error, oauthUsed: result.oauthUsed, nitroAvailable: result.nitroAvailable, scan: result.scan || null, discordSync: result.synced || null }); }
@@ -268,6 +271,20 @@ client.once('ready', async () => {
 client.on('presenceUpdate', async (_old, p) => { if (p?.member && !p.member.user?.bot) await syncMember(p.member, { preserveWhenPresenceMissing: false }); });
 client.on('guildMemberAdd', async m => { if (!m.user?.bot) await syncMember(await m.guild.members.fetch({ user: m.id, force: true, withPresences: true }).catch(() => m)); });
 client.on('guildMemberUpdate', async (_old, m) => { if (!m.user?.bot) await syncMember(m); });
-client.on('error', e => console.error('[ERRO BOT]', e));
+client.on('error', e => noteDiscordError('ERRO BOT', e));
+client.on('shardError', e => noteDiscordError('SHARD', e));
+client.on('shardDisconnect', (event) => noteDiscordError('DESCONECTADO', `código ${event?.code ?? '?'}`));
+client.once('ready', () => { lastDiscordError = null; });
 if (!process.env.DISCORD_BOT_TOKEN) { console.error('DISCORD_BOT_TOKEN ausente'); process.exit(1); }
-client.login(process.env.DISCORD_BOT_TOKEN.trim());
+// Se o login falhar (token errado, intents desligadas, bloqueio do Discord), registra o motivo e tenta de novo.
+const login = async (attempt = 1) => {
+  try {
+    await client.login(process.env.DISCORD_BOT_TOKEN.trim());
+  } catch (e) {
+    noteDiscordError('LOGIN', e);
+    const delay = Math.min(10 * 60_000, 30_000 * attempt);
+    console.error(`[LOGIN] nova tentativa em ${Math.round(delay / 1000)}s`);
+    setTimeout(() => void login(attempt + 1), delay);
+  }
+};
+void login();
